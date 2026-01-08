@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Jupyter / OS
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db
+
+# Experiment artifacts
+wandb/
+logs/
+checkpoints/
+trained_models/
+runs/
+outputs/
+assests/
+
+# Data (local)
+data/
+datasets/**/data/
+data_preparation/
+
+# Large model files
+*.ckpt
+*.pth
+*.pt
+*.bin
+*.safetensors
+*.zip
+*.png
+
+# Env exports (opcional: decide si quieres trackearlos)
+conda_*.yml
+pip_*_freeze.txt

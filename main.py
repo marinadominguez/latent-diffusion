@@ -16,6 +16,7 @@ from pytorch_lightning.trainer import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint, Callback, LearningRateMonitor
 from pytorch_lightning.utilities.distributed import rank_zero_only
 from pytorch_lightning.utilities import rank_zero_info
+from pytorch_lightning.loggers import WandbLogger
 
 from ldm.data.base import Txt2ImgIterableBaseDataset
 from ldm.util import instantiate_from_config
@@ -296,6 +297,7 @@ class ImageLogger(Callback):
         self.max_images = max_images
         self.logger_log_images = {
             pl.loggers.TestTubeLogger: self._testtube,
+            WandbLogger: self._wandb,
         }
         self.log_steps = [2 ** n for n in range(int(np.log2(self.batch_freq)) + 1)]
         if not increase_log_steps:
@@ -316,7 +318,30 @@ class ImageLogger(Callback):
             pl_module.logger.experiment.add_image(
                 tag, grid,
                 global_step=pl_module.global_step)
+    
+    @rank_zero_only
+    def _wandb(self, pl_module, images, batch_idx, split):
+        try:
+            import wandb
+        except Exception:
+            return
 
+        for k in images:
+            grid = torchvision.utils.make_grid(images[k])  # C,H,W (tensor)
+            if self.rescale:
+                grid = (grid + 1.0) / 2.0
+            grid = torch.clamp(grid, 0.0, 1.0)
+
+            # a numpy HWC uint8
+            grid = (grid.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            tag = f"{split}/{k}"
+
+            # wandb espera lista de imágenes para "media"
+            pl_module.logger.experiment.log(
+                {tag: [wandb.Image(grid)]},
+                step=pl_module.global_step
+            )
+    
     @rank_zero_only
     def log_local(self, save_dir, split, images,
                   global_step, current_epoch, batch_idx):
@@ -518,7 +543,23 @@ if __name__ == "__main__":
         # merge trainer cli with config
         trainer_config = lightning_config.get("trainer", OmegaConf.create())
         # default to ddp
-        trainer_config["accelerator"] = "ddp"
+        #trainer_config["accelerator"] = "ddp"
+        import platform
+
+        # default to ddp ONLY if we really do multi-gpu and not on Windows
+        if "gpus" in trainer_config:
+            gpuinfo = str(trainer_config["gpus"])
+            gpu_list = [g for g in gpuinfo.strip(",").split(",") if g != ""]
+            is_multi_gpu = len(gpu_list) > 1
+        else:
+            is_multi_gpu = False
+
+        if is_multi_gpu and platform.system().lower() != "windows":
+            trainer_config["accelerator"] = "ddp"
+        else:
+            # single GPU (or Windows): run non-distributed
+            trainer_config.pop("accelerator", None)
+
         for k in nondefault_trainer_args(opt):
             trainer_config[k] = getattr(opt, k)
         if not "gpus" in trainer_config:
@@ -709,9 +750,15 @@ if __name__ == "__main__":
 
 
         import signal
+        import platform
 
-        signal.signal(signal.SIGUSR1, melk)
-        signal.signal(signal.SIGUSR2, divein)
+        #signal.signal(signal.SIGUSR1, melk)
+        #signal.signal(signal.SIGUSR2, divein)
+
+        if hasattr(signal, "SIGUSR1"):
+            signal.signal(signal.SIGUSR1, melk)
+        if hasattr(signal, "SIGUSR2"):
+            signal.signal(signal.SIGUSR2, divein)
 
         # run
         if opt.train:

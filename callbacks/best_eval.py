@@ -1,0 +1,360 @@
+import os, json, shutil
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, List
+
+import torch
+import torchvision
+from pytorch_lightning.callbacks import Callback
+from pytorch_lightning.utilities.distributed import rank_zero_only
+
+# Si ya tienes LPIPS/SSIM utils en el repo, reutilízalos.
+# Si no: piqa/torchmetrics (SSIM) + lpips (alex) funcionan bien.
+import lpips
+# SSIM: compatible con varias versiones de torchmetrics, con fallback a scikit-image
+try:
+    from torchmetrics.image import StructuralSimilarityIndexMeasure  # torchmetrics >=0.11 aprox
+except Exception:
+    try:
+        from torchmetrics import StructuralSimilarityIndexMeasure     # otras versiones
+    except Exception:
+        StructuralSimilarityIndexMeasure = None
+
+try:
+    from skimage.metrics import structural_similarity as sk_ssim
+except Exception:
+    sk_ssim = None
+
+from PIL import Image
+import numpy as np
+
+
+def _ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
+
+def _atomic_write_json(path: str, obj: Dict[str, Any]):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=2)
+    os.replace(tmp, path)
+
+def _rm_and_mkdir(path: str):
+    shutil.rmtree(path, ignore_errors=True)
+    os.makedirs(path, exist_ok=True)
+
+def _to_uint8_img(x_chw: torch.Tensor) -> np.ndarray:
+    """
+    x_chw: tensor C,H,W en [0,1]
+    Devuelve uint8 H,W o H,W,3
+    """
+    x = x_chw.detach().cpu().clamp(0, 1)
+    if x.shape[0] == 1:
+        x = x[0]  # H,W
+        return (x.numpy() * 255).astype(np.uint8)
+    else:
+        x = x.permute(1, 2, 0)  # H,W,C
+        return (x.numpy() * 255).astype(np.uint8)
+
+@dataclass
+class EvalCfg:
+    eval_every_steps: int = 2000
+    save_every_steps: int = 2000
+    num_samples_metric: int = 64
+    num_samples_save: int = 250
+    grid_n: int = 16
+    w_lpips: float = 1.0
+    real_pool_dir: str = ""          # pool fijo de reales (p.ej. testing/)
+    real_pool_max: int = 250
+    use_fid: bool = False
+    fid_real_dir: str = ""           # si calculas FID aparte
+    fid_max_real: int = 250
+    device: str = "cuda"
+    # sampling params (si usas LDM)
+    ddim_steps: int = 50
+    ddim_eta: float = 1.0
+    real_rotate_deg: int = 0
+
+class BestEvalCallback(Callback):
+    def __init__(self, outdir: str, cfg: EvalCfg):
+        super().__init__()
+        self.outdir = outdir
+        self.cfg = cfg
+
+        self.best_path = os.path.join(outdir, "best.json")
+        self.best_dir = os.path.join(outdir, "best")
+        self.best_eval_dir = os.path.join(outdir, "best_eval")
+        self.best_eval_samples = os.path.join(self.best_eval_dir, "samples")
+
+        self._lpips = None
+        self._ssim = None
+        self._real_pool = None  # tensor [M,1,H,W] en [-1,1] o [0,1] según uses
+        self._real_pool_loaded = False
+
+    def _lazy_init_metrics(self, device: torch.device):
+        if self._lpips is None:
+            self._lpips = lpips.LPIPS(net="alex").to(device).eval()
+
+        # SSIM: si existe la clase de torchmetrics la usamos, si no, fallback a skimage
+        if self._ssim is None:
+            if StructuralSimilarityIndexMeasure is not None:
+                self._ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
+            else:
+                self._ssim = "skimage"
+                if sk_ssim is None:
+                    raise ImportError("No hay StructuralSimilarityIndexMeasure y tampoco skimage instalado.")
+
+    def _load_real_pool(self, pl_module, device: torch.device):
+        """
+        Carga un pool fijo de reales en memoria (hasta real_pool_max).
+        Idealmente: mismos preprocesados que tu dataset (resize 256, grayscale, normalización).
+        """
+        if self._real_pool_loaded:
+            return
+        pool_dir = self.cfg.real_pool_dir
+        if not pool_dir:
+            raise ValueError("real_pool_dir está vacío. Necesito un pool fijo para NN matching.")
+
+        # Lista simple de png/jpg
+        exts = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
+        files = [os.path.join(pool_dir, f) for f in sorted(os.listdir(pool_dir)) if f.lower().endswith(exts)]
+        files = files[: self.cfg.real_pool_max]
+
+        imgs = []
+        for fp in files:
+            im = Image.open(fp).convert("L")
+            if self.cfg.real_rotate_deg:
+                im = im.rotate(self.cfg.real_rotate_deg, expand=True)
+            im = im.resize((256, 256), resample=Image.BILINEAR)
+            arr = np.array(im).astype(np.float32) / 255.0  # [0,1]
+            t = torch.from_numpy(arr)[None, ...]  # 1,H,W
+            imgs.append(t)
+        if len(imgs) == 0:
+            raise ValueError(f"No encontré imágenes en real_pool_dir={pool_dir}")
+
+        pool = torch.stack(imgs, dim=0).to(device)  # M,1,H,W en [0,1]
+        self._real_pool = pool
+        self._real_pool_loaded = True
+        
+    @torch.no_grad()
+    def _sample_images(self, pl_module, n: int, device: torch.device) -> torch.Tensor:
+        """
+        Devuelve samples en [0,1], shape [n,1,H,W] (grayscale).
+        Para LDM: sample_log -> latentes -> decode_first_stage -> imagen.
+        """
+        # LDM: tiene sample_log(cond, batch_size, ddim, ddim_steps, ...)
+        if hasattr(pl_module, "sample_log") and callable(pl_module.sample_log):
+            # unconditional => cond=None
+            ddim_steps = self.cfg.ddim_steps
+            ddim_eta = self.cfg.ddim_eta
+            #ddim_steps = getattr(self.cfg, "ddim_steps", 50) if hasattr(self.cfg, "ddim_steps") else 50
+            #ddim_eta = getattr(self.cfg, "ddim_eta", 1.0) if hasattr(self.cfg, "ddim_eta") else 1.0
+
+            latents, _ = pl_module.sample_log(
+                cond=None,
+                batch_size=n,
+                ddim=True,
+                ddim_steps=ddim_steps,
+                eta=ddim_eta,
+            )
+
+            # decode a pixel space si existe decode_first_stage
+            if hasattr(pl_module, "decode_first_stage"):
+                x = pl_module.decode_first_stage(latents)
+            else:
+                x = latents
+
+            # normalmente x está en [-1,1]
+            if x.min() < 0:
+                x = (x + 1.0) / 2.0
+
+            # a 1 canal (grayscale)
+            if x.shape[1] != 1:
+                x = x.mean(dim=1, keepdim=True)
+
+            return x.clamp(0, 1)
+
+        # fallback (DDPM clásico)
+        if hasattr(pl_module, "sample") and callable(pl_module.sample):
+            x = pl_module.sample(batch_size=n)
+            if x.min() < 0:
+                x = (x + 1.0) / 2.0
+            if x.shape[1] != 1:
+                x = x.mean(dim=1, keepdim=True)
+            return x.clamp(0, 1)
+
+        raise RuntimeError("No encuentro sampling compatible (sample_log/sample).")
+
+    @torch.no_grad()
+    def evaluate_metrics(self, pl_module, device: torch.device) -> Dict[str, float]:
+        self._lazy_init_metrics(device)
+        self._load_real_pool(pl_module, device)
+
+        n = self.cfg.num_samples_metric
+        gen = self._sample_images(pl_module, n=n, device=device)  # [n,1,H,W] [0,1]
+
+        # NN matching por LPIPS contra real_pool en chunks
+        pool = self._real_pool  # [M,1,H,W] [0,1]
+        M = pool.shape[0]
+        chunk = 32
+
+        ssim_vals = []
+        lpips_vals = []
+
+        for i in range(n):
+            g = gen[i:i+1]  # 1,1,H,W
+            best_lp = None
+            best_j = None
+            for j0 in range(0, M, chunk):
+                r = pool[j0:j0+chunk]  # c,1,H,W
+                # LPIPS espera 3 canales típicamente; para grayscale duplicamos
+                g3 = g.repeat(1,3,1,1)
+                r3 = r.repeat(1,3,1,1)
+                # lpips devuelve [batch,1,1,1] o [batch]
+                d = self._lpips(g3.expand_as(r3), r3).view(-1)  # [c]
+                v, idx = torch.min(d, dim=0)
+                if best_lp is None or v.item() < best_lp:
+                    best_lp = v.item()
+                    best_j = j0 + idx.item()
+
+            nn = pool[best_j:best_j+1]  # 1,1,H,W
+            # SSIM (en [0,1])
+            if self._ssim == "skimage":
+                # g, nn: [1,1,H,W] en [0,1]
+                g_np = g[0, 0].detach().cpu().numpy()
+                n_np = nn[0, 0].detach().cpu().numpy()
+                ssim_vals.append(float(sk_ssim(g_np, n_np, data_range=1.0)))
+            else:
+                ssim_vals.append(self._ssim(g, nn).item())
+            # LPIPS final con su NN (promedio)
+            g3 = g.repeat(1,3,1,1)
+            n3 = nn.repeat(1,3,1,1)
+            lpips_vals.append(self._lpips(g3, n3).view(-1).mean().item())
+
+        ssim_nn = float(np.mean(ssim_vals))
+        lpips_nn = float(np.mean(lpips_vals))
+        score = ssim_nn - self.cfg.w_lpips * lpips_nn
+
+        return {
+            "eval/ssim_nn": ssim_nn,
+            "eval/lpips_nn": lpips_nn,
+            "eval/score": score,
+        }
+
+    def _read_best(self) -> Optional[Dict[str, Any]]:
+        if not os.path.exists(self.best_path):
+            return None
+        with open(self.best_path, "r") as f:
+            return json.load(f)
+
+    @rank_zero_only
+    def save_best_checkpoint(self, trainer, pl_module, metrics: Dict[str, float], improved: bool):
+        if not improved:
+            return
+
+        step = int(pl_module.global_step)
+        _ensure_dir(self.best_dir)
+
+        # 1) checkpoint overwrite (copiamos last.ckpt)
+        last_ckpt = os.path.join(trainer.logdir, "checkpoints", "last.ckpt")
+        if not os.path.exists(last_ckpt):
+            # fallback: guardarlo “a mano”
+            last_ckpt = os.path.join(trainer.logdir, "checkpoints", "last.ckpt")
+            trainer.save_checkpoint(last_ckpt)
+
+        best_ckpt = os.path.join(self.best_dir, "best.ckpt")
+        shutil.copy2(last_ckpt, best_ckpt)
+
+        # 2) best.json
+        best_obj = {
+            "step": step,
+            "score": metrics["eval/score"],
+            "ssim_nn": metrics["eval/ssim_nn"],
+            "lpips_nn": metrics["eval/lpips_nn"],
+            "best_ckpt": best_ckpt,
+        }
+        _atomic_write_json(self.best_path, best_obj)
+
+        # 3) overwrite best_eval/
+        _rm_and_mkdir(self.best_eval_dir)
+        _rm_and_mkdir(self.best_eval_samples)
+
+        # re-sample num_samples_save y guardar pngs
+        device = pl_module.device
+        self._lazy_init_metrics(device)
+        with torch.no_grad():
+            gen = self._sample_images(pl_module, n=self.cfg.num_samples_save, device=device)
+
+        # save pngs
+        for i in range(gen.shape[0]):
+            arr = _to_uint8_img(gen[i])
+            Image.fromarray(arr).save(os.path.join(self.best_eval_samples, f"sample_{i:05d}.png"))
+
+        # grid.png (16)
+        k = min(self.cfg.grid_n, gen.shape[0])
+        grid = torchvision.utils.make_grid(gen[:k], nrow=4)  # C,H,W
+        grid_arr = _to_uint8_img(grid)
+        Image.fromarray(grid_arr).save(os.path.join(self.best_eval_dir, "grid.png"))
+
+        # metrics.json
+        _atomic_write_json(os.path.join(self.best_eval_dir, "metrics.json"), best_obj)
+
+        # opcional: log a W&B “best/*”
+        if trainer.logger is not None:
+            trainer.logger.log_metrics({
+                "best/step": step,
+                "best/score": best_obj["score"],
+                "best/ssim": best_obj["ssim_nn"],
+                "best/lpips": best_obj["lpips_nn"],
+            }, step=step)
+
+    def _is_improved(self, new_score: float) -> bool:
+        old = self._read_best()
+        if old is None:
+            return True
+        return new_score > float(old.get("score", -1e9))
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, *args, **kwargs):
+        step = int(pl_module.global_step)
+        if step <= 0:
+            return
+        if step % self.cfg.eval_every_steps != 0:
+            return
+        if trainer.global_rank != 0:
+            return
+
+        # Eval mode (EMA si existe)
+        was_training = pl_module.training
+        pl_module.eval()
+
+        ctx = getattr(pl_module, "ema_scope", None)
+        if callable(ctx):
+            ema_ctx = pl_module.ema_scope()
+        else:
+            class _Null:
+                def __enter__(self): return None
+                def __exit__(self, *args): return False
+            ema_ctx = _Null()
+
+        device = pl_module.device
+        with torch.no_grad(), ema_ctx:
+            metrics = self.evaluate_metrics(pl_module, device=device)
+
+        # log siempre (W&B)
+        if trainer.logger is not None:
+            trainer.logger.log_metrics(metrics, step=step)
+
+        # solo comparamos si coincide con save_every (para tener ckpt del mismo step)
+        if step % self.cfg.save_every_steps == 0:
+            improved = self._is_improved(metrics["eval/score"])
+            self.save_best_checkpoint(trainer, pl_module, metrics, improved=improved)
+
+        if was_training:
+            pl_module.train()
+        
+    def on_fit_start(self, trainer, pl_module, *args, **kwargs): 
+        # si outdir es None o "__trainer_logdir__", úsalo del trainer
+        if self.outdir in [None, "", "__trainer_logdir__"]:
+            self.outdir = trainer.logdir
+            self.best_path = os.path.join(self.outdir, "best.json")
+            self.best_dir = os.path.join(self.outdir, "best")
+            self.best_eval_dir = os.path.join(self.outdir, "best_eval")
+            self.best_eval_samples = os.path.join(self.best_eval_dir, "samples")

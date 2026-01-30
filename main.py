@@ -250,13 +250,13 @@ class SetupCallback(Callback):
         self.lightning_config = lightning_config
 
     def on_keyboard_interrupt(self, trainer, pl_module):
-        if trainer.global_rank == 0:
+        if trainer is not None and trainer.global_rank == 0:
             print("Summoning checkpoint.")
             ckpt_path = os.path.join(self.ckptdir, "last.ckpt")
             trainer.save_checkpoint(ckpt_path)
 
     def on_pretrain_routine_start(self, trainer, pl_module):
-        if trainer.global_rank == 0:
+        if trainer is not None and trainer.global_rank == 0:
             # Create logdirs and save configs
             os.makedirs(self.logdir, exist_ok=True)
             os.makedirs(self.ckptdir, exist_ok=True)
@@ -376,6 +376,14 @@ class ImageLogger(Callback):
 
             with torch.no_grad():
                 images = pl_module.log_images(batch, split=split, **self.log_images_kwargs)
+                # --- loggear masks aunque el modelo no las use ---
+                if isinstance(batch, dict) and "mask" in batch:
+                    bm = batch["mask"]
+                    if isinstance(bm, torch.Tensor):
+                        # asegurar shape Nx1xHxW para que make_grid no pete
+                        if bm.dim() == 3:
+                            bm = bm.unsqueeze(1)  # N,H,W -> N,1,H,W (por si acaso)
+                        images["mask"] = bm.detach()
 
             for k in images:
                 N = min(images[k].shape[0], self.max_images)
@@ -391,6 +399,13 @@ class ImageLogger(Callback):
             logger_log_images = self.logger_log_images.get(logger, lambda *args, **kwargs: None)
             logger_log_images(pl_module, images, pl_module.global_step, split)
 
+            if isinstance(batch, dict) and "mask" in batch:
+                bm = batch["mask"]
+                if isinstance(bm, torch.Tensor):
+                    if bm.dim() == 3:
+                        bm = bm.unsqueeze(1)  # N,H,W -> N,1,H,W (por si acaso)
+                    images["mask"] = bm.detach()
+                    
             if is_train:
                 pl_module.train()
 
@@ -533,13 +548,15 @@ if __name__ == "__main__":
 
     ckptdir = os.path.join(logdir, "checkpoints")
     cfgdir = os.path.join(logdir, "configs")
-    seed_everything(opt.seed)
-
+    #seed_everything(opt.seed)
+    trainer = None
     try:
         # init and save configs
         configs = [OmegaConf.load(cfg) for cfg in opt.base]
         cli = OmegaConf.from_dotlist(unknown)
         config = OmegaConf.merge(*configs, cli)
+        seed = int(getattr(config, "seed", opt.seed))
+        seed_everything(seed)
         lightning_config = config.pop("lightning", OmegaConf.create())
         # merge trainer cli with config
         trainer_config = lightning_config.get("trainer", OmegaConf.create())
@@ -738,14 +755,15 @@ if __name__ == "__main__":
         # allow checkpointing via USR1
         def melk(*args, **kwargs):
             # run all checkpoint hooks
-            if trainer.global_rank == 0:
-                print("Summoning checkpoint.")
+            if trainer is not None and trainer.global_rank == 0:
+                print(trainer.profiler.summary())
                 ckpt_path = os.path.join(ckptdir, "last.ckpt")
                 trainer.save_checkpoint(ckpt_path)
 
 
         def divein(*args, **kwargs):
-            if trainer.global_rank == 0:
+            if trainer is not None and trainer.global_rank == 0:
+                print(" Diving into debugger ")
                 import pudb;
                 pudb.set_trace()
 
@@ -771,7 +789,7 @@ if __name__ == "__main__":
         if not opt.no_test and not trainer.interrupted:
             trainer.test(model, data)
     except Exception:
-        if opt.debug and trainer.global_rank == 0:
+        if opt.debug and (trainer is None or trainer.global_rank == 0):
             try:
                 import pudb as debugger
             except ImportError:
@@ -785,5 +803,5 @@ if __name__ == "__main__":
             dst = os.path.join(dst, "debug_runs", name)
             os.makedirs(os.path.split(dst)[0], exist_ok=True)
             os.rename(logdir, dst)
-        if trainer.global_rank == 0:
+        if trainer is not None and trainer.global_rank == 0:
             print(trainer.profiler.summary())

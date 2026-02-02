@@ -377,13 +377,15 @@ class ImageLogger(Callback):
             with torch.no_grad():
                 images = pl_module.log_images(batch, split=split, **self.log_images_kwargs)
                 # --- loggear masks aunque el modelo no las use ---
-                if isinstance(batch, dict) and "mask" in batch:
-                    bm = batch["mask"]
-                    if isinstance(bm, torch.Tensor):
-                        # asegurar shape Nx1xHxW para que make_grid no pete
-                        if bm.dim() == 3:
-                            bm = bm.unsqueeze(1)  # N,H,W -> N,1,H,W (por si acaso)
-                        images["mask"] = bm.detach()
+                if isinstance(batch, dict):
+                    for k in ("mask", "mask3", "mask4"):
+                        if k in batch:
+                            bm = batch[k]
+                            if isinstance(bm, torch.Tensor):
+                                # asegurar Nx1xHxW para make_grid
+                                if bm.dim() == 3:
+                                    bm = bm.unsqueeze(1)  # N,H,W -> N,1,H,W
+                                images[k] = bm.detach()
 
             for k in images:
                 N = min(images[k].shape[0], self.max_images)
@@ -398,13 +400,6 @@ class ImageLogger(Callback):
 
             logger_log_images = self.logger_log_images.get(logger, lambda *args, **kwargs: None)
             logger_log_images(pl_module, images, pl_module.global_step, split)
-
-            if isinstance(batch, dict) and "mask" in batch:
-                bm = batch["mask"]
-                if isinstance(bm, torch.Tensor):
-                    if bm.dim() == 3:
-                        bm = bm.unsqueeze(1)  # N,H,W -> N,1,H,W (por si acaso)
-                    images["mask"] = bm.detach()
                     
             if is_train:
                 pl_module.train()

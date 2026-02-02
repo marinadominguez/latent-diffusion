@@ -72,6 +72,7 @@ class EvalCfg:
     ddim_steps: int = 50
     ddim_eta: float = 1.0
     real_rotate_deg: int = 0
+    sample_chunk_size: int = 8   # <-- NUEVO: tamaño de chunk para sampling 
 
 class BestEvalCallback(Callback):
     def __init__(self, outdir: str, cfg: EvalCfg):
@@ -137,51 +138,49 @@ class BestEvalCallback(Callback):
     @torch.no_grad()
     def _sample_images(self, pl_module, n: int, device: torch.device) -> torch.Tensor:
         """
-        Devuelve samples en [0,1], shape [n,1,H,W] (grayscale).
-        Para LDM: sample_log -> latentes -> decode_first_stage -> imagen.
+        Sampling en chunks para evitar OOM.
+        Devuelve [n,1,H,W] en [0,1] en CPU.
         """
-        # LDM: tiene sample_log(cond, batch_size, ddim, ddim_steps, ...)
-        if hasattr(pl_module, "sample_log") and callable(pl_module.sample_log):
-            # unconditional => cond=None
-            ddim_steps = self.cfg.ddim_steps
-            ddim_eta = self.cfg.ddim_eta
-            #ddim_steps = getattr(self.cfg, "ddim_steps", 50) if hasattr(self.cfg, "ddim_steps") else 50
-            #ddim_eta = getattr(self.cfg, "ddim_eta", 1.0) if hasattr(self.cfg, "ddim_eta") else 1.0
+        chunk = int(getattr(self.cfg, "sample_chunk_size", 8))
+        chunk = max(1, min(chunk, n))
 
-            latents, _ = pl_module.sample_log(
-                cond=None,
-                batch_size=n,
-                ddim=True,
-                ddim_steps=ddim_steps,
-                eta=ddim_eta,
-            )
+        outs_cpu = []
+        for j0 in range(0, n, chunk):
+            bs = min(chunk, n - j0)
 
-            # decode a pixel space si existe decode_first_stage
-            if hasattr(pl_module, "decode_first_stage"):
-                x = pl_module.decode_first_stage(latents)
+            if hasattr(pl_module, "sample_log") and callable(pl_module.sample_log):
+                latents, _ = pl_module.sample_log(
+                    cond=None,
+                    batch_size=bs,
+                    ddim=True,
+                    ddim_steps=self.cfg.ddim_steps,
+                    eta=self.cfg.ddim_eta,
+                )
+                x = pl_module.decode_first_stage(latents) if hasattr(pl_module, "decode_first_stage") else latents
+            elif hasattr(pl_module, "sample") and callable(pl_module.sample):
+                x = pl_module.sample(batch_size=bs)
             else:
-                x = latents
+                raise RuntimeError("No encuentro sampling compatible (sample_log/sample).")
 
-            # normalmente x está en [-1,1]
+            # Normaliza a [0,1]
             if x.min() < 0:
                 x = (x + 1.0) / 2.0
 
-            # a 1 canal (grayscale)
+            # A 1 canal
             if x.shape[1] != 1:
                 x = x.mean(dim=1, keepdim=True)
 
-            return x.clamp(0, 1)
+            outs_cpu.append(x.clamp(0, 1).detach().cpu())
 
-        # fallback (DDPM clásico)
-        if hasattr(pl_module, "sample") and callable(pl_module.sample):
-            x = pl_module.sample(batch_size=n)
-            if x.min() < 0:
-                x = (x + 1.0) / 2.0
-            if x.shape[1] != 1:
-                x = x.mean(dim=1, keepdim=True)
-            return x.clamp(0, 1)
+            # libera cuanto antes
+            del x
+            try:
+                del latents
+            except Exception:
+                pass
+            torch.cuda.empty_cache()
 
-        raise RuntimeError("No encuentro sampling compatible (sample_log/sample).")
+        return torch.cat(outs_cpu, dim=0)
 
     @torch.no_grad()
     def evaluate_metrics(self, pl_module, device: torch.device) -> Dict[str, float]:
@@ -189,7 +188,8 @@ class BestEvalCallback(Callback):
         self._load_real_pool(pl_module, device)
 
         n = self.cfg.num_samples_metric
-        gen = self._sample_images(pl_module, n=n, device=device)  # [n,1,H,W] [0,1]
+        #gen = self._sample_images(pl_module, n=n, device=device)  # [n,1,H,W] [0,1]
+        gen_cpu = self._sample_images(pl_module, n=n, device=device)  # CPU
 
         # NN matching por LPIPS contra real_pool en chunks
         pool = self._real_pool  # [M,1,H,W] [0,1]
@@ -200,7 +200,7 @@ class BestEvalCallback(Callback):
         lpips_vals = []
 
         for i in range(n):
-            g = gen[i:i+1]  # 1,1,H,W
+            g = gen_cpu[i:i+1].to(device, non_blocking=True)  # 1,1,H,W en GPU
             best_lp = None
             best_j = None
             for j0 in range(0, M, chunk):
@@ -277,22 +277,49 @@ class BestEvalCallback(Callback):
         _rm_and_mkdir(self.best_eval_dir)
         _rm_and_mkdir(self.best_eval_samples)
 
-        # re-sample num_samples_save y guardar pngs
         device = pl_module.device
         self._lazy_init_metrics(device)
-        with torch.no_grad():
-            gen = self._sample_images(pl_module, n=self.cfg.num_samples_save, device=device)
 
-        # save pngs
-        for i in range(gen.shape[0]):
-            arr = _to_uint8_img(gen[i])
-            Image.fromarray(arr).save(os.path.join(self.best_eval_samples, f"sample_{i:05d}.png"))
+        n_save = int(self.cfg.num_samples_save)
+        chunk = int(getattr(self.cfg, "sample_chunk_size", 8))
+        chunk = max(1, min(chunk, n_save))
 
-        # grid.png (16)
-        k = min(self.cfg.grid_n, gen.shape[0])
-        grid = torchvision.utils.make_grid(gen[:k], nrow=4)  # C,H,W
-        grid_arr = _to_uint8_img(grid)
-        Image.fromarray(grid_arr).save(os.path.join(self.best_eval_dir, "grid.png"))
+        # Para grid: vamos acumulando solo las primeras grid_n
+        grid_keep = int(self.cfg.grid_n)
+        grid_buf = []
+
+        idx = 0
+        for j0 in range(0, n_save, chunk):
+            bs = min(chunk, n_save - j0)
+
+            # sample chunk -> CPU
+            gen_chunk = self._sample_images(pl_module, n=bs, device=device)  # [bs,1,H,W] CPU
+
+            # guarda pngs
+            for b in range(gen_chunk.shape[0]):
+                arr = _to_uint8_img(gen_chunk[b])
+                Image.fromarray(arr).save(os.path.join(self.best_eval_samples, f"sample_{idx:05d}.png"))
+                idx += 1
+
+            # llena buffer del grid solo con las primeras grid_n
+            if len(grid_buf) < grid_keep:
+                take = min(grid_keep - len(grid_buf), gen_chunk.shape[0])
+                if take > 0:
+                    grid_buf.append(gen_chunk[:take])
+
+            del gen_chunk
+            torch.cuda.empty_cache()
+
+        # grid.png
+        if len(grid_buf) > 0:
+            grid_tensor = torch.cat(grid_buf, dim=0)  # CPU [k,1,H,W]
+            k = grid_tensor.shape[0]
+            #nrow = int(np.sqrt(k))
+            nrow = int(np.ceil(np.sqrt(k)))
+            nrow = max(1, nrow)
+            grid = torchvision.utils.make_grid(grid_tensor, nrow=nrow)  # CPU C,H,W
+            grid_arr = _to_uint8_img(grid)
+            Image.fromarray(grid_arr).save(os.path.join(self.best_eval_dir, "grid.png"))
 
         # metrics.json
         _atomic_write_json(os.path.join(self.best_eval_dir, "metrics.json"), best_obj)

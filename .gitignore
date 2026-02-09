@@ -39,3 +39,5 @@ pip_*_freeze.txt
 latent_diffusion.egg-info/
 src/clip/
 src/taming-transformers/
+
+sample_ldm_from_ckpt.py

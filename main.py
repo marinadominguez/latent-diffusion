@@ -347,6 +347,16 @@ class ImageLogger(Callback):
                   global_step, current_epoch, batch_idx):
         root = os.path.join(save_dir, "images", split)
         for k in images:
+            # --- fix: torchvision.make_grid espera NCHW; si viene NHWC/HWC lo convertimos ---
+            if isinstance(images[k], torch.Tensor):
+                t = images[k]
+                # NHWC -> NCHW
+                if t.dim() == 4 and (t.shape[1] not in (1,3)) and (t.shape[-1] in (1,3)):
+                    t = t.permute(0, 3, 1, 2).contiguous()
+                # HWC -> CHW (y añade batch)
+                elif t.dim() == 3 and (t.shape[0] not in (1,3)) and (t.shape[-1] in (1,3)):
+                    t = t.permute(2, 0, 1).contiguous().unsqueeze(0)
+                images[k] = t
             grid = torchvision.utils.make_grid(images[k], nrow=4)
             if self.rescale:
                 grid = (grid + 1.0) / 2.0  # -1,1 -> 0,1; c,h,w
